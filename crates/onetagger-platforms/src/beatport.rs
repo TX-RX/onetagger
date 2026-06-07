@@ -323,15 +323,15 @@ impl AutotaggerSource for Beatport {
         for page in 1..custom_config.max_pages + 1 {
             match self.search(&query, page, 50) {
                 Ok(res) => {
-                    // Match
-                    let tracks = res.data
+                    // Match (Convert API response to Track objects)
+                    let api_tracks = res.data
                         .into_iter()
                         .map(|t| t.to_track(custom_config.art_resolution))
                         .collect::<Vec<_>>();
 
-                    // Ignore version match
-                    let tracks = if custom_config.ignore_version {
-                        let t = tracks.clone().into_iter().map(|mut t| {
+                    // Standard Matching Logic (Remains completely untouched)
+                    let mut matched_tracks = if custom_config.ignore_version {
+                        let t = api_tracks.clone().into_iter().map(|mut t| {
                             t.version = None;
                             t
                         }).collect();
@@ -340,18 +340,85 @@ impl AutotaggerSource for Beatport {
                         MatchingUtils::match_track(info, &t, config, true)
                             .into_iter()
                             .map(|mut t| {
-                                if let Some(ot) = tracks.iter().find(|ot| ot.url == t.track.url) {
+                                if let Some(ot) = api_tracks.iter().find(|ot| ot.url == t.track.url) {
                                     t.track.version = ot.version.to_owned();
                                 }
                                 t
                             })
                             .collect()
                     } else {
-                        MatchingUtils::match_track(info, &tracks, config, true)
+                        MatchingUtils::match_track(info, &api_tracks, config, true)
                     };
 
+                    // --- NEW FALLBACK LOGIC START ---
+                    let best_accuracy = matched_tracks.iter().map(|m| m.accuracy).fold(0.0, f64::max);
+                    
+                    // If the original logic failed to find a strong match (< 80%), trigger fallback
+                    if best_accuracy < 0.80 {
+                        if let Ok(local_title_full) = info.title() {
+                            // Extract trailing mix name: "Title (Extended Mix)" -> "Title", "Extended Mix"
+                            let re = regex::Regex::new(r"^(.*?)\s*(?:\(|\[)([^()\[\]]+)(?:\)|\])$").unwrap();
+                            
+                            let (local_title, local_mix) = if let Some(caps) = re.captures(local_title_full) {
+                                (caps.get(1).map_or("", |m| m.as_str()).trim(), caps.get(2).map_or("", |m| m.as_str()).trim())
+                            } else {
+                                (local_title_full.trim(), "")
+                            };
+
+                            let local_mix_clean = local_mix.to_lowercase();
+
+                            // Evaluate against the original API tracks
+                            for track in &api_tracks {
+                                let beatport_title = &track.title;
+                                let beatport_mix_clean = track.version.as_deref().unwrap_or("").to_lowercase();
+
+                                // 1. Grade Title independently
+                                let title_acc = strsim::normalized_levenshtein(
+                                    &MatchingUtils::clean_title_matching(local_title),
+                                    &MatchingUtils::clean_title_matching(beatport_title)
+                                );
+
+                                // 2. STRICT VERSION CONTROL (The Kill Switch)
+                                let is_version_match = if !local_mix_clean.is_empty() && !beatport_mix_clean.is_empty() {
+                                    // Both have mix names: they must be at least 70% similar (e.g. allows "Radio Edit" vs "Radio Mix", but blocks "Extended" vs "Radio")
+                                    strsim::normalized_levenshtein(&local_mix_clean, &beatport_mix_clean) >= 0.70
+                                } else if (local_mix_clean.is_empty() || local_mix_clean == "original mix") && 
+                                          (beatport_mix_clean.is_empty() || beatport_mix_clean == "original mix") {
+                                    // Covers standard DJ tracks: no mix name usually implies the Original Mix
+                                    true 
+                                } else {
+                                    // One has a specific mix (e.g., "Extended Mix") and the other doesn't.
+                                    false 
+                                };
+
+                                // VETO: If the versions do not match, skip this API track entirely! 
+                                if !is_version_match {
+                                    continue; 
+                                }
+
+                                // 3. Combine scores
+                                // Since we already vetted the mix name with the kill switch, we give it a perfect 1.0 for the 30% weight.
+                                let final_acc = (title_acc * 0.7) + (1.0 * 0.3);
+
+                                // 4. If it meets the strictness threshold and the artist matches, apply it
+                                if final_acc >= config.strictness && MatchingUtils::match_artist(&info.artists, &track.artists, config.strictness) {
+                                    // Update the existing match if this score is better
+                                    if let Some(existing) = matched_tracks.iter_mut().find(|m| m.track.url == track.url) {
+                                        if final_acc > existing.accuracy {
+                                            existing.accuracy = final_acc;
+                                        }
+                                    } else {
+                                        // Otherwise, add it as a new valid match
+                                        matched_tracks.push(TrackMatch::new(final_acc, track.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // --- NEW FALLBACK LOGIC END ---
+
                     // Return
-                    output.extend(tracks);
+                    output.extend(matched_tracks);
 
                     if config.fetch_all_results {
                         continue;
