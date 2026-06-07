@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Error};
 use std::time::Duration;
 use reqwest::StatusCode;
@@ -14,6 +15,52 @@ use onetagger_tagger::{
 use serde_json::json;
 
 const INVALID_ART: &'static str = "ab2d1d04-233d-4b08-8234-9782b34dcab8";
+
+// OPTIMIZATION: Compile Regex exactly once for the application's lifetime
+static MIX_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+
+/// DJ Metadata Resolution: Categorical Version Taxonomy
+#[derive(PartialEq, Eq, Debug)]
+enum MixType {
+    Original,
+    Extended,
+    Club,
+    Radio,
+    Edit,
+    Remix,
+    Dub,
+    Unknown,
+}
+
+impl MixType {
+    fn from_str(s: &str) -> Self {
+        let m = s.to_lowercase();
+        
+        // 1. HIGHEST PRIORITY: Remixes & Dubs
+        // Must be checked first so "Extended Remix" triggers as a Remix, not an Extended Mix.
+        if m.contains("remix") || m.contains("rmx") || m.contains("rework") {
+            MixType::Remix
+        } else if m.contains("dub") {
+            MixType::Dub
+            
+        // 2. SECONDARY PRIORITY: Arrangement Types
+        } else if m.contains("extended") {
+            MixType::Extended
+        } else if m.contains("club") {
+            MixType::Club 
+        } else if m.contains("radio") {
+            MixType::Radio
+        } else if m.contains("edit") || m.contains("short") {
+            MixType::Edit
+            
+        // 3. FALLBACKS: Originals and Unknowns
+        } else if m.is_empty() || m == "original mix" || m == "original" || m == "orig. mix" {
+            MixType::Original
+        } else {
+            MixType::Unknown
+        }
+    }
+}
 
 pub struct Beatport {
     client: Client,
@@ -353,11 +400,12 @@ impl AutotaggerSource for Beatport {
                     // --- NEW FALLBACK LOGIC START ---
                     let best_accuracy = matched_tracks.iter().map(|m| m.accuracy).fold(0.0, f64::max);
                     
-                    // If the original logic failed to find a strong match (< 80%), trigger fallback
+                    // Trigger fallback only if the original logic struggled (< 80%)
                     if best_accuracy < 0.80 {
                         if let Ok(local_title_full) = info.title() {
-                            // Extract trailing mix name: "Title (Extended Mix)" -> "Title", "Extended Mix"
-                            let re = regex::Regex::new(r"^(.*?)\s*(?:\(|\[)([^()\[\]]+)(?:\)|\])$").unwrap();
+                            
+                            // Initialize Regex securely once
+                            let re = MIX_REGEX.get_or_init(|| regex::Regex::new(r"^(.*?)\s*(?:\(|\[)([^()\[\]]+)(?:\)|\])$").unwrap());
                             
                             let (local_title, local_mix) = if let Some(caps) = re.captures(local_title_full) {
                                 (caps.get(1).map_or("", |m| m.as_str()).trim(), caps.get(2).map_or("", |m| m.as_str()).trim())
@@ -365,54 +413,101 @@ impl AutotaggerSource for Beatport {
                                 (local_title_full.trim(), "")
                             };
 
-                            let local_mix_clean = local_mix.to_lowercase();
+                            // OPTIMIZATION: Define helper closures OUTSIDE the loop to prevent reallocation
+                            let normalize_punctuation = |s: &str| -> String {
+                                s.to_lowercase().replace(['(', ')', '[', ']', '-', ',', '.', '!'], " ")
+                            };
 
-                            // Evaluate against the original API tracks
+                            let normalize_artists = |artists: &Vec<String>| -> HashSet<String> {
+                                artists.iter()
+                                    .flat_map(|a| a.to_lowercase().replace("&", "and").split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+                                    .filter(|s| !s.is_empty())
+                                    .collect()
+                            };
+
+                            let local_mix_clean = normalize_punctuation(local_mix);
+                            let local_cat = MixType::from_str(&local_mix_clean);
+                            let local_artist_words = normalize_artists(&info.artists);
+
+                            // O(1) Lookup: Use a HashMap to avoid O(N²) vector iteration
+                            let mut match_map: HashMap<String, TrackMatch> = matched_tracks.into_iter().map(|m| (m.track.url.clone(), m)).collect();
+
                             for track in &api_tracks {
                                 let beatport_title = &track.title;
-                                let beatport_mix_clean = track.version.as_deref().unwrap_or("").to_lowercase();
+                                let beatport_mix_clean = normalize_punctuation(track.version.as_deref().unwrap_or(""));
+                                let api_cat = MixType::from_str(&beatport_mix_clean);
 
-                                // 1. Grade Title independently
+                                let mut is_compatible = false;
+                                let mut mix_acc = 1.0;
+
+                                // Pragmatic Compatibility Matrix
+                                if local_cat == api_cat 
+                                    || (local_cat == MixType::Club && api_cat == MixType::Extended)
+                                    || (local_cat == MixType::Extended && api_cat == MixType::Club) {
+                                    
+                                    if local_cat == MixType::Remix || local_cat == MixType::Dub {
+                                        // Token-based Jaccard similarity for unordered remix words
+                                        let words_local: HashSet<&str> = local_mix_clean.split_whitespace().collect();
+                                        let words_api: HashSet<&str> = beatport_mix_clean.split_whitespace().collect();
+                                        let intersection = words_local.intersection(&words_api).count() as f64;
+                                        let union = words_local.union(&words_api).count() as f64;
+                                        
+                                        let jaccard = if union == 0.0 { 1.0 } else { intersection / union };
+                                        
+                                        if jaccard >= 0.50 {
+                                            is_compatible = true;
+                                            mix_acc = jaccard;
+                                        }
+                                    } else {
+                                        is_compatible = true;
+                                    }
+                                } else if (local_cat == MixType::Original && api_cat == MixType::Unknown) || 
+                                          (local_cat == MixType::Unknown && api_cat == MixType::Original) ||
+                                          (local_cat == MixType::Unknown && api_cat == MixType::Unknown) {
+                                    // Safe Unknown bridging
+                                    is_compatible = true;
+                                }
+
+                                // VETO: Version conflict
+                                if !is_compatible {
+                                    continue; 
+                                }
+
+                                // 1. Title Score
                                 let title_acc = strsim::normalized_levenshtein(
                                     &MatchingUtils::clean_title_matching(local_title),
                                     &MatchingUtils::clean_title_matching(beatport_title)
                                 );
 
-                                // 2. STRICT VERSION CONTROL (The Kill Switch)
-                                let is_version_match = if !local_mix_clean.is_empty() && !beatport_mix_clean.is_empty() {
-                                    // Both have mix names: they must be at least 70% similar (e.g. allows "Radio Edit" vs "Radio Mix", but blocks "Extended" vs "Radio")
-                                    strsim::normalized_levenshtein(&local_mix_clean, &beatport_mix_clean) >= 0.70
-                                } else if (local_mix_clean.is_empty() || local_mix_clean == "original mix") && 
-                                          (beatport_mix_clean.is_empty() || beatport_mix_clean == "original mix") {
-                                    // Covers standard DJ tracks: no mix name usually implies the Original Mix
-                                    true 
+                                // 2. Semantic Artist Score (Strict Hierarchy Enforced)
+                                let artist_acc = if MatchingUtils::match_artist(&info.artists, &track.artists, config.strictness) {
+                                    1.0 // Exact match defines the ceiling
                                 } else {
-                                    // One has a specific mix (e.g., "Extended Mix") and the other doesn't.
-                                    false 
+                                    let api_artist_words = normalize_artists(&track.artists);
+                                    let intersection = local_artist_words.intersection(&api_artist_words).count() as f64;
+                                    let union = local_artist_words.union(&api_artist_words).count() as f64;
+                                    
+                                    let jaccard = if union == 0.0 { 0.0 } else { intersection / union };
+                                    jaccard * 0.9 // Fuzzy match capped below exact match
                                 };
 
-                                // VETO: If the versions do not match, skip this API track entirely! 
-                                if !is_version_match {
-                                    continue; 
-                                }
+                                // 3. Weighted Feature Resolution (50% Title, 30% Artist, 20% Version Category)
+                                mix_acc = mix_acc.clamp(0.0, 1.0); // Defensive clamping
+                                let final_acc = (title_acc * 0.5) + (artist_acc * 0.3) + (mix_acc * 0.2);
 
-                                // 3. Combine scores
-                                // Since we already vetted the mix name with the kill switch, we give it a perfect 1.0 for the 30% weight.
-                                let final_acc = (title_acc * 0.7) + (1.0 * 0.3);
-
-                                // 4. If it meets the strictness threshold and the artist matches, apply it
-                                if final_acc >= config.strictness && MatchingUtils::match_artist(&info.artists, &track.artists, config.strictness) {
-                                    // Update the existing match if this score is better
-                                    if let Some(existing) = matched_tracks.iter_mut().find(|m| m.track.url == track.url) {
-                                        if final_acc > existing.accuracy {
-                                            existing.accuracy = final_acc;
-                                        }
-                                    } else {
-                                        // Otherwise, add it as a new valid match
-                                        matched_tracks.push(TrackMatch::new(final_acc, track.clone()));
-                                    }
+                                // Apply to internal map
+                                if final_acc >= config.strictness {
+                                    match_map.entry(track.url.clone())
+                                        .and_modify(|existing| {
+                                            if final_acc > existing.accuracy {
+                                                existing.accuracy = final_acc;
+                                            }
+                                        })
+                                        .or_insert_with(|| TrackMatch::new(final_acc, track.clone()));
                                 }
                             }
+                            // Convert Hashmap back to Vector
+                            matched_tracks = match_map.into_values().collect();
                         }
                     }
                     // --- NEW FALLBACK LOGIC END ---
