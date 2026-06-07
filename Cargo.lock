@@ -3524,6 +3524,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "strsim",
  "url",
 ]
 

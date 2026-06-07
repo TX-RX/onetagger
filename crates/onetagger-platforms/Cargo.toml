@@ -31,3 +31,4 @@ rspotify = { version = "0.15", features = [
 onetagger-tag = { path = "../onetagger-tag" }
 onetagger-shared = { path = "../onetagger-shared" }
 onetagger-tagger = { path = "../onetagger-tagger" }
+strsim = "0.11.1"
