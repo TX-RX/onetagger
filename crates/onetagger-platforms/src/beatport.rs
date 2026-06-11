@@ -114,6 +114,7 @@ impl Beatport {
         let t = token.clone().unwrap();
         if t.expires_in <= timestamp!() {
             *token = None;
+            drop(token); // FIX: Explicitly drop the mutex guard to prevent deadlocks on recursion
             return self.update_token();
         }
 
@@ -160,7 +161,24 @@ impl Beatport {
     }
 
     pub fn clear_search_query(query: &str) -> String {
-        query.replace("(", "").replace(")", "")
+        let re = FEATURE_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\s+(?:ft|feat|featuring)\.?\s+[^()]+").unwrap());
+        let stripped_query = re.replace_all(query, "").to_string();
+
+        stripped_query
+            .replace("(", " ")
+            .replace(")", " ")
+            .replace("[", " ")
+            .replace("]", " ")
+            .replace(",", " ")
+            .replace("Ft.", "")
+            .replace("ft.", "")
+            .replace(" Ft ", " ")
+            .replace(" ft ", " ")
+            .replace(" feat. ", " ")
+            .replace(" feat ", " ")
+            .replace("  ", " ")
+            .trim()
+            .to_string()
     }
 }
 
@@ -258,8 +276,8 @@ impl BeatportTrack {
             remixers: self.remixers.into_iter().map(|r| r.name).collect(),
             track_number: self.number.map(|n| TrackNumber::Number(n as i32)),
             isrc: self.isrc,
-            release_year: self.new_release_date.as_ref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()).map(|d| d.year() as i16),
-            publish_year: self.publish_date.as_ref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()).map(|d| d.year() as i16),
+            release_year: self.new_release_date.as_ref().and_then(|d| d.chars().take(4).collect::<String>().parse().ok()),
+            publish_year: self.publish_date.as_ref().and_then(|d| d.chars().take(4).collect::<String>().parse().ok()),
             release_date: self.new_release_date.as_ref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
             publish_date: self.publish_date.as_ref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
             thumbnail,
@@ -315,17 +333,17 @@ impl AutotaggerSource for Beatport {
             match self.search(isrc, 1, 25) {
                 Ok(results) => {
                     if !results.data.is_empty() {
-                        let track = self.track(results.data[0].id)?;
-
-                        match track {
-                            Some(track) => {
+                        // FIX: Graceful failover if track detail fetch fails, rather than hard crashing `?`
+                        match self.track(results.data[0].id) {
+                            Ok(Some(track)) => {
                                 let track = TrackMatch::new_isrc(track.to_track(custom_config.art_resolution));
                                 if !config.fetch_all_results {
                                     return Ok(vec![track]);
                                 }
                                 output.push(track);
                             },
-                            None => warn!("Matching by ISRC failed, track restricted, trying normal."),
+                            Ok(None) => warn!("Matching by ISRC failed, track restricted, trying normal."),
+                            Err(e) => warn!("Failed fetching track details by ISRC: {e}, falling back to normal match."),
                         }
                     }
                 },
@@ -333,9 +351,6 @@ impl AutotaggerSource for Beatport {
             }
         }
 
-        // HARDCODED REGEX: We embed your regex directly into the Rust code.
-        // This silently strips the features from the search query so Beatport is guaranteed to find it,
-        // even if the user has the UI setting turned completely OFF.
         let raw_title = info.title().unwrap_or("");
         let re_feat = FEATURE_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\s+(?:ft|feat|featuring)\.?\s+[^()]+").unwrap());
         let virtual_title = re_feat.replace_all(raw_title, "").to_string();
@@ -433,7 +448,6 @@ impl AutotaggerSource for Beatport {
                             continue; 
                         }
 
-                        // UNIVERSAL MATH FIX: We also strip features from Beatport's title so the Math Engine scores a perfect 1.0.
                         let beatport_title_clean = re_feat.replace_all(beatport_title_original, "").to_string();
 
                         let title_acc = strsim::normalized_levenshtein(
@@ -477,14 +491,15 @@ impl AutotaggerSource for Beatport {
                     matched_tracks.sort_by(|a, b| b.accuracy.partial_cmp(&a.accuracy).unwrap_or(std::cmp::Ordering::Equal));
                     // --- NEW FALLBACK LOGIC END ---
 
-                    // Return
                     output.extend(matched_tracks);
 
                     if config.fetch_all_results {
                         continue;
                     }
-
-                    return Ok(output);
+                    
+                    if output.iter().any(|m| m.accuracy >= config.strictness) {
+                        return Ok(output);
+                    }
                 },
                 Err(e) => {
                     warn!("Beatport search failed, query: {}. {}", query, e);
@@ -500,20 +515,30 @@ impl AutotaggerSource for Beatport {
         let custom_config: BeatportConfig = config.get_custom("beatport")?;
 
         if track.other.is_empty() {
-            let id = track.track_id.as_ref().unwrap().parse().unwrap();
-            *track = self.track(id)?.ok_or(anyhow!("Restricted track"))?.to_track(custom_config.art_resolution);
+            if let Some(track_id_str) = &track.track_id {
+                if let Ok(id) = track_id_str.parse() {
+                    if let Ok(Some(api_track)) = self.track(id) {
+                        *track = api_track.to_track(custom_config.art_resolution);
+                    }
+                }
+            }
         }
 
         if !config.tag_enabled(SupportedTag::AlbumArtist) && !config.tag_enabled(SupportedTag::TrackTotal) {
             return Ok(());
         }
 
-        let release = self.release(track.release_id.as_ref().ok_or(anyhow!("Missing release_id"))?.parse()?)?;
-        track.track_total = release.track_count;
-        track.album_artists = match release.artists {
-            Some(a) => a.into_iter().map(|a| a.name).collect(),
-            None => vec![],
-        };
+        if let Some(release_id_str) = &track.release_id {
+            if let Ok(id) = release_id_str.parse() {
+                if let Ok(release) = self.release(id) {
+                    track.track_total = release.track_count;
+                    track.album_artists = match release.artists {
+                        Some(a) => a.into_iter().map(|a| a.name).collect(),
+                        None => vec![],
+                    };
+                }
+            }
+        }
 
         Ok(())
     }
