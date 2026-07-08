@@ -436,10 +436,10 @@ impl AudioFileInfoImpl for AudioFileInfo {
             .map(|a| AudioFileInfo::parse_artist_tag(a.iter().map(|a| a.as_str()).collect()));
 
         // Parse filename
-        if (title.is_none() || artists.is_none()) && filename_template.is_some() {
+        let mut filename_extra_tags: HashMap<String, Vec<String>> = HashMap::new();
+        if let Some(re) = filename_template.as_ref() {
             let filename = path.as_ref().file_name().ok_or(anyhow!("Missing filename!"))?.to_str().ok_or(anyhow!("Missing filename"))?;
-            if let Some(captures) = filename_template.unwrap().captures(filename) {                
-                
+            if let Some(captures) = re.captures(filename) {
                 // Title
                 if title.is_none() {
                     if let Some(m) = captures.name("title") {
@@ -450,6 +450,19 @@ impl AudioFileInfoImpl for AudioFileInfo {
                 if artists.is_none() {
                     if let Some(m) = captures.name("artists") {
                         artists = Some(AudioFileInfo::parse_artist_tag(vec![m.as_str().trim()]));
+                    }
+                }
+                // Any additional named captures (e.g. %beatport_track_id%) get promoted
+                // to tags so platform matchers can pick them up as if they were on the file.
+                for name in re.capture_names().flatten() {
+                    if name == "title" || name == "artists" {
+                        continue;
+                    }
+                    if let Some(m) = captures.name(name) {
+                        let v = m.as_str().trim();
+                        if !v.is_empty() {
+                            filename_extra_tags.insert(name.to_uppercase(), vec![v.to_string()]);
+                        }
                     }
                 }
             }
@@ -477,6 +490,11 @@ impl AudioFileInfoImpl for AudioFileInfo {
 
         // Track number
         let track_number = tag.get_field(Field::TrackNumber).unwrap_or(vec![String::new()])[0].parse().ok();
+        // Merge filename-derived tags (e.g. platform IDs). ID3 tags on the file win.
+        let mut tags = tag.all_tags();
+        for (k, v) in filename_extra_tags {
+            tags.entry(k).or_insert(v);
+        }
         Ok(AudioFileInfo {
             format: tag_wrap.format(),
             title,
@@ -486,7 +504,7 @@ impl AudioFileInfoImpl for AudioFileInfo {
             duration: None,
             track_number,
             tagged,
-            tags: tag.all_tags()
+            tags,
         })
     }
 
@@ -508,12 +526,13 @@ impl AudioFileInfoImpl for AudioFileInfo {
         for c in reserved.chars() {
             template = template.replace(c, &format!("\\{}", c));
         };
-        // Replace variables
-        template = template
-            .replace("%title%", "(?P<title>.+?)")
-            .replace("%artist%", "(?P<artists>.+?)")
-            .replace("%artists%", "(?P<artists>.+?)");
-        // Remove all remaining variables
+        // %artist% is an alias for %artists%
+        template = template.replace("%artist%", "%artists%");
+        // Promote identifier-safe placeholders (e.g. %title%, %artists%, %beatport_track_id%)
+        // to named captures. Names with spaces or leading digits fall through to the catch-all.
+        let named_re = Regex::new("%([a-zA-Z_][a-zA-Z0-9_]*)%").unwrap();
+        template = named_re.replace_all(&template, "(?P<$1>.+?)").to_string();
+        // Remove any remaining variables (legacy names with spaces)
         let re = Regex::new("%[a-zA-Z0-9 ]+%").unwrap();
         template = re.replace_all(&template, "(.+)").to_string();
         // Extension
@@ -632,12 +651,22 @@ impl Tagger {
     pub fn tag_files(cfg: &TaggerConfig, mut files: Vec<PathBuf>, finished: Arc<Mutex<Option<TaggerFinishedData>>>) -> Receiver<TaggingStatusWrap> {
         STOP_TAGGING.store(false, Ordering::SeqCst);
 
+        // Backfill missing per-platform custom configs with defaults. The frontend
+        // sometimes ships an empty `custom` map, which trips `get_custom("beatport")?`
+        // (and similar) with "Missing beatport custom config!" before any tagging can
+        // start. Filling from `custom_default()` keeps the platforms functional.
+        let mut config = cfg.clone();
+        let default_custom = TaggerConfig::custom_default().custom;
+        for (platform, options) in default_custom.0.into_iter() {
+            config.custom.0.entry(platform).or_insert(options);
+        }
+
         // Shuffle so album tag is more "efficient"
-        if cfg.album_tagging {
+        if config.album_tagging {
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
         }
-        
+
         // let original_files = files.clone();
         let mut succesful_files = vec![];
         let mut failed_files = vec![];
@@ -646,7 +675,6 @@ impl Tagger {
 
         // Create thread
         let (tx, rx) = unbounded();
-        let config = cfg.clone();
         std::thread::spawn(move || {
             // Tag
             for (platform_index, platform) in config.platforms.iter().enumerate() {
