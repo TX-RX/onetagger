@@ -651,12 +651,22 @@ impl Tagger {
     pub fn tag_files(cfg: &TaggerConfig, mut files: Vec<PathBuf>, finished: Arc<Mutex<Option<TaggerFinishedData>>>) -> Receiver<TaggingStatusWrap> {
         STOP_TAGGING.store(false, Ordering::SeqCst);
 
+        // Backfill missing per-platform custom configs with defaults. The frontend
+        // sometimes ships an empty `custom` map, which trips `get_custom("beatport")?`
+        // (and similar) with "Missing beatport custom config!" before any tagging can
+        // start. Filling from `custom_default()` keeps the platforms functional.
+        let mut config = cfg.clone();
+        let default_custom = TaggerConfig::custom_default().custom;
+        for (platform, options) in default_custom.0.into_iter() {
+            config.custom.0.entry(platform).or_insert(options);
+        }
+
         // Shuffle so album tag is more "efficient"
-        if cfg.album_tagging {
+        if config.album_tagging {
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
         }
-        
+
         // let original_files = files.clone();
         let mut succesful_files = vec![];
         let mut failed_files = vec![];
@@ -665,7 +675,6 @@ impl Tagger {
 
         // Create thread
         let (tx, rx) = unbounded();
-        let config = cfg.clone();
         std::thread::spawn(move || {
             // Tag
             for (platform_index, platform) in config.platforms.iter().enumerate() {
